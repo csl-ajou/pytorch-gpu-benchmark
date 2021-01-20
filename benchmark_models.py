@@ -40,7 +40,10 @@ parser.add_argument('--NUM_TEST','-n', type=int,default=50,required=False, help=
 parser.add_argument('--BATCH_SIZE','-b', type=int, default=12, required=False, help='Num of batch size')
 parser.add_argument('--NUM_CLASSES','-c', type=int, default=1000, required=False, help='Num of class')
 parser.add_argument('--NUM_GPU','-g', type=int, default=1, required=False, help='Num of gpus')
+parser.add_argument('--PRECISION','-p', type=str, default='float', required=False, help='Precision')
+parser.add_argument('--MODEL','-m', type=str, required=True, help='Model name') 
 parser.add_argument('--folder','-f', type=str, default='result', required=False, help='folder to save results')
+parser.add_argument('--INFERENCE','-i',type=bool, default=False, required=False, help='Test only inference')
 args = parser.parse_args()
 args.BATCH_SIZE*=args.NUM_GPU
 class RandomDataset(Dataset):
@@ -57,35 +60,49 @@ class RandomDataset(Dataset):
 
 rand_loader = DataLoader(dataset=RandomDataset( args.BATCH_SIZE*(args.WARM_UP + args.NUM_TEST)),
                          batch_size=args.BATCH_SIZE, shuffle=False,num_workers=8)
-def train(precision='single'):
+def train(precision, model_name):
     """use fake image for training speed test"""
     target = torch.LongTensor(args.BATCH_SIZE).random_(args.NUM_CLASSES).cuda()
     criterion = nn.CrossEntropyLoss()
     benchmark = {}
-    for model_type in MODEL_LIST.keys():
-        for model_name in MODEL_LIST[model_type]:
-            model = getattr(model_type, model_name)(pretrained=False)
-            if args.NUM_GPU > 1:
-                model = nn.DataParallel(model,device_ids=range(args.NUM_GPU))
-            model=getattr(model,precision)()
-            model=model.to('cuda')
-            durations = []
-            print(f'Benchmarking Training {precision} precision type {model_name} ')
-            for step,img in enumerate(rand_loader):
-                img=getattr(img,precision)()
-                torch.cuda.synchronize()
-                start = time.time()
-                model.zero_grad()
-                prediction = model(img.to('cuda'))
-                loss = criterion(prediction, target)
-                loss.backward()
-                torch.cuda.synchronize()
-                end = time.time()
-                if step >= args.WARM_UP:
-                    durations.append((end - start)*1000)
-            print(f'{model_name} model average train time : {sum(durations)/len(durations)}ms')
-            del model
-            benchmark[model_name] = durations
+
+    model = getattr(models, model_name)(pretrained=False)
+    
+    if args.NUM_GPU > 1:
+        model = nn.DataParallel(model,device_ids=range(args.NUM_GPU))
+    model=getattr(model,precision)()
+    model=model.to('cuda')
+    durations = []
+    ten_step_duration = 0
+    print(f'Benchmarking Training {precision} precision type {model_name} ')
+    for step,img in enumerate(rand_loader):
+        img=getattr(img,precision)()
+        torch.cuda.synchronize()
+        start = time.time()
+        model.zero_grad()
+        prediction = model(img.to('cuda'))
+        loss = criterion(prediction, target)
+        loss.backward()
+        torch.cuda.synchronize()
+        end = time.time()
+        if step >= args.WARM_UP:
+            duration = (end - start) * 1000
+            durations.append(duration)
+            ten_step_duration += duration
+            if ((step - args.WARM_UP) != 0 and ((step-args.WARM_UP)+1) % 10 == 0):
+                print(f'model {(step - args.WARM_UP) + 1} step : {ten_step_duration/10:.2f} ms, {(args.BATCH_SIZE * 10) / (ten_step_duration / 1000):.2f} images')
+                ten_step_duration = 0
+
+    print_template=f"""
+{model_name} model ({args.BATCH_SIZE} batch size)
+Average train time : {sum(durations)/len(durations):.2f} ms
+Average throughput : {(args.BATCH_SIZE * args.NUM_TEST) / (sum(durations) / 1000):.2f} images
+"""
+
+    print(print_template)
+
+    benchmark[model_name] = durations
+
     return benchmark
 
 def inference(precision='float'):
@@ -152,16 +169,20 @@ if __name__ == '__main__':
         f.writelines(s + '\n' for s in gpu_configs )
 
     
-    for precision in precisions:
-        train_result=train(precision)
-        train_result_df = pd.DataFrame(train_result)
-        path=f'{folder_name}/{device_name}_{precision}_model_train_benchmark.csv'
-        train_result_df.to_csv(path, index=False)
+    is_inference = args.INFERENCE
+    model_name = args.MODEL
 
+    if (is_inference):
         inference_result=inference(precision)
         inference_result_df = pd.DataFrame(inference_result)
         path=f'{folder_name}/{device_name}_{precision}_model_inference_benchmark.csv'
         inference_result_df.to_csv(path, index=False)
+    else:
+        precision = args.PRECISION
+        train_result=train(precision, model_name)
+        train_result_df = pd.DataFrame(train_result)
+        path=f'{folder_name}/{device_name}_{precision}_model_train_benchmark.csv'
+        train_result_df.to_csv(path, index=False)
 
     now = datetime.datetime.now()
 
