@@ -7,10 +7,13 @@ import torch.nn as nn
 import datetime
 import time
 import os
+import signal
 import pandas as pd
 import argparse
 from torch.utils.data import Dataset, DataLoader
 import json
+from torchsummary import summary
+
 torch.backends.cudnn.benchmark = True
 # https://discuss.pytorch.org/t/what-does-torch-backends-cudnn-benchmark-do/5936
 # This flag allows you to enable the inbuilt cudnn auto-tuner to find the best algorithm to use for your hardware. 
@@ -46,6 +49,7 @@ parser.add_argument('--folder','-f', type=str, default='result', required=False,
 parser.add_argument('--INFERENCE','-i',type=bool, default=False, required=False, help='Test only inference')
 args = parser.parse_args()
 args.BATCH_SIZE*=args.NUM_GPU
+
 class RandomDataset(Dataset):
 
     def __init__(self,  length):
@@ -75,6 +79,9 @@ def train(precision, model_name):
     durations = []
     ten_step_duration = 0
     print(f'Benchmarking Training {precision} precision type {model_name} ')
+
+    #summary(model, input_size=(3, 224, 224), batch_size=args.BATCH_SIZE)
+
     for step,img in enumerate(rand_loader):
         img=getattr(img,precision)()
         torch.cuda.synchronize()
@@ -105,31 +112,35 @@ Average throughput : {(args.BATCH_SIZE * args.NUM_TEST) / (sum(durations) / 1000
 
     return benchmark
 
-def inference(precision='float'):
+def inference(precision, model_name):
     benchmark = {}
+
+    model = getattr(models, model_name)(pretrained=False)
+
     with torch.no_grad():
-        for model_type in MODEL_LIST.keys():
-            for model_name in MODEL_LIST[model_type]:
-                model = getattr(model_type, model_name)(pretrained=False)
-                if args.NUM_GPU > 1:
-                    model = nn.DataParallel(model,device_ids=range(args.NUM_GPU))
-                model=getattr(model,precision)()
-                model=model.to('cuda')
-                model.eval()
-                durations = []
-                print(f'Benchmarking Inference {precision} precision type {model_name} ')
-                for step,img in enumerate(rand_loader):
-                    img=getattr(img,precision)()
-                    torch.cuda.synchronize()
-                    start = time.time()
-                    model(img.to('cuda'))
-                    torch.cuda.synchronize()
-                    end = time.time()
-                    if step >= args.WARM_UP:
-                        durations.append((end - start)*1000)
-                print(f'{model_name} model average inference time : {sum(durations)/len(durations)}ms')
-                del model
-                benchmark[model_name] = durations
+        if args.NUM_GPU > 1:
+            model = nn.DataParallel(model,device_ids=range(args.NUM_GPU))
+        model=getattr(model,precision)()
+        model=model.to('cuda')
+        model.eval()
+        durations = []
+        print(f'Benchmarking Inference {precision} precision type {model_name} ')
+
+        #summary(model, input_size=(3, 224, 224), batch_size=args.BATCH_SIZE)
+
+        for step,img in enumerate(rand_loader):
+            img=getattr(img,precision)()
+            torch.cuda.synchronize()
+            start = time.time()
+            model(img.to('cuda'))
+            torch.cuda.synchronize()
+            end = time.time()
+            if step >= args.WARM_UP:
+                durations.append((end - start)*1000)
+        print(f'{model_name} model average inference time : {sum(durations)/len(durations)}ms')
+        del model
+        benchmark[model_name] = durations
+
     return benchmark
 
 f"{platform.uname()}\n{psutil.cpu_freq()}\ncpu_count: {psutil.cpu_count()}\nmemory_available: {psutil.virtual_memory().available}"
@@ -173,7 +184,8 @@ if __name__ == '__main__':
     model_name = args.MODEL
 
     if (is_inference):
-        inference_result=inference(precision)
+        precision = args.PRECISION
+        inference_result=inference(precision, model_name)
         inference_result_df = pd.DataFrame(inference_result)
         path=f'{folder_name}/{device_name}_{precision}_model_inference_benchmark.csv'
         inference_result_df.to_csv(path, index=False)
